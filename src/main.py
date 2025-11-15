@@ -1,4 +1,6 @@
-# File: src/main.py
+# ===============================================
+# src/main.py  (drop-in replacement)
+# ===============================================
 from __future__ import annotations
 
 # stdlib
@@ -13,17 +15,15 @@ from chess import Move
 # chesshacks runtime
 from .utils import chess_manager, GameContext
 
-# ---------- config ----------
-ENV_MODEL = os.getenv("CHESS_EVAL_MODEL", "")
-ENV_DEVICE = os.getenv("CHESS_EVAL_DEVICE", "cpu")      # default CPU
-ENV_DISABLE_NN = os.getenv("CHESS_EVAL_DISABLE_NN", "1") in ("1", "true", "True")  # default: NN off for fast boot
+# -------- config (safe defaults for CI) --------
+ENV_MODEL = os.getenv("CHESS_EVAL_MODEL", "")             # e.g., "src/eval_mlp.pt"
+ENV_DEVICE = os.getenv("CHESS_EVAL_DEVICE", "cpu")        # force CPU by default
+ENV_DISABLE_NN = os.getenv("CHESS_EVAL_DISABLE_NN", "1") in ("1", "true", "True")
 MAX_DEPTH = int(os.getenv("ENGINE_DEPTH", "3"))
 TIME_MS = int(os.getenv("ENGINE_TIME_MS", "250"))
 TEMP = float(os.getenv("ENGINE_TEMP", "1.0"))
 
-
-# ---------- features (no numpy dependency; pure Python lists) ----------
-# 12x64 bitboards + side + castling(4) + en passant(64) = 837 floats
+# -------- ultra-light features (no numpy) --------
 def fen_to_features_py(fen: str) -> List[float]:
     b = chess.Board(fen)
     out: List[float] = []
@@ -33,7 +33,7 @@ def fen_to_features_py(fen: str) -> List[float]:
             for sq in b.pieces(pt, color):
                 m[sq] = 1.0
             out.extend(m)
-    out.append(1.0 if b.turn == chess.WHITE else 0.0)  # side to move
+    out.append(1.0 if b.turn == chess.WHITE else 0.0)
     out.extend([
         1.0 if b.has_kingside_castling_rights(chess.WHITE) else 0.0,
         1.0 if b.has_queenside_castling_rights(chess.WHITE) else 0.0,
@@ -44,48 +44,35 @@ def fen_to_features_py(fen: str) -> List[float]:
     if b.ep_square is not None:
         ep[b.ep_square] = 1.0
     out.extend(ep)
-    return out  # len=837
+    return out  # 837
 
-# ---------- material fallback (no torch) ----------
-MAT_PAWNS = {chess.PAWN:1, chess.KNIGHT:3, chess.BISHOP:3, chess.ROOK:5, chess.QUEEN:9, chess.KING:0}
-PIECE_CP  = {chess.PAWN:100, chess.KNIGHT:320, chess.BISHOP:330, chess.ROOK:500, chess.QUEEN:900, chess.KING:0}
+# -------- material fallback (no torch) --------
+MAT_P = {chess.PAWN:1, chess.KNIGHT:3, chess.BISHOP:3, chess.ROOK:5, chess.QUEEN:9, chess.KING:0}
+PIECE_CP = {chess.PAWN:100, chess.KNIGHT:320, chess.BISHOP:330, chess.ROOK:500, chess.QUEEN:900, chess.KING:0}
 
 def material_eval_pawns(board: chess.Board) -> float:
     s = 0.0
     for _, p in board.piece_map().items():
-        s += MAT_PAWNS[p.piece_type] if p.color == chess.WHITE else -MAT_PAWNS[p.piece_type]
+        s += MAT_P[p.piece_type] if p.color == chess.WHITE else -MAT_P[p.piece_type]
     return s
 
-def blended_eval_cp_material(board: chess.Board) -> int:
-    # cp anchor from material only
-    mat = 0
-    for _, p in board.piece_map().items():
-        mat += PIECE_CP[p.piece_type] if p.color == chess.WHITE else -PIECE_CP[p.piece_type]
-    # 0.75*0 + 0.25*mat ≈ material-only cp
-    white_cp = int(0.25 * mat)
-    return white_cp if board.turn == chess.WHITE else -white_cp
-
-# ---------- lazy NN loader ----------
+# -------- lazy torch holder --------
 class _TorchBundle:
     torch = None
     nn = None
 
 def _device_from(env: str) -> "object":
-    # returns torch.device or a sentinel string when torch is absent
     if _TorchBundle.torch is None:
         return "cpu"
     t = _TorchBundle.torch
-    if env == "cpu":
-        return t.device("cpu")
-    if env == "cuda" and t.cuda.is_available():
-        return t.device("cuda")
-    if env == "mps" and getattr(t.backends, "mps", None) and t.backends.mps.is_available():
-        return t.device("mps")
+    if env == "cuda" and t.cuda.is_available(): return t.device("cuda")
+    if env == "mps" and getattr(t.backends, "mps", None) and t.backends.mps.is_available(): return t.device("mps")
     return t.device("cpu")
 
+# -------- tiny MLP (must match training topology) --------
 class EvalMLPtorch:
     def __init__(self, input_dim: int, hidden: int, layers: int, device):
-        t = _TorchBundle.torch; nn = _TorchBundle.nn
+        t, nn = _TorchBundle.torch, _TorchBundle.nn
         blocks: List[object] = []
         d = input_dim
         for _ in range(layers - 1):
@@ -94,7 +81,25 @@ class EvalMLPtorch:
         blocks += [nn.Linear(d, 1)]
         self.net = nn.Sequential(*blocks).to(device)
         self.device = device
-
+    def load_state(self, sd: dict) -> None:
+        # try whole model first; if mismatch, adjust "net." prefix
+        def _try_load(module, state) -> bool:
+            try:
+                module.load_state_dict(state, strict=True)
+                return True
+            except Exception:
+                return False
+        if _try_load(self, sd):
+            return
+        if all(k.startswith("net.") for k in sd.keys()):
+            sd2 = {k.split("net.", 1)[1]: v for k, v in sd.items()}
+            if _try_load(self.net, sd2):
+                return
+        else:
+            sd2 = {f"net.{k}": v for k, v in sd.items()}
+            if _try_load(self, sd2):
+                return
+        raise RuntimeError("state_dict key mismatch (prefix adjust failed)")
     def forward(self, x_list: List[float]) -> float:
         t = _TorchBundle.torch
         x = t.tensor([x_list], dtype=t.float32, device=self.device)
@@ -103,30 +108,24 @@ class EvalMLPtorch:
         return float(y)
 
 class EvalScorer:
-    """Uses NN if available and not disabled; otherwise material fallback."""
-    def __init__(self, model_path: Optional[str], device_pref: str, disable_nn: bool) -> None:
+    """Uses NN if enabled; else material fallback."""
+    def __init__(self, model_path: Optional[str], device_pref: str, disable_nn: bool):
         self.disable_nn = disable_nn
         self.using_fallback = True
-        self.device_pref = device_pref
         self.device = "cpu"
         self.model: Optional[EvalMLPtorch] = None
 
-        # 1) Fast exit if disabled
         if self.disable_nn:
             print("[eval] NN disabled via CHESS_EVAL_DISABLE_NN; using material fallback")
             return
 
-        # 2) Lazy import torch
         try:
-            import torch as _t
-            import torch.nn as _nn
-            _TorchBundle.torch = _t
-            _TorchBundle.nn = _nn
+            import torch as _t, torch.nn as _nn
+            _TorchBundle.torch, _TorchBundle.nn = _t, _nn
         except Exception as e:
             print(f"[eval] torch import failed ({e}); using material fallback")
             return
 
-        # 3) Device and paths
         self.device = _device_from(device_pref)
         p = Path(model_path) if model_path else Path(__file__).resolve().parent / "eval_mlp.pt"
         cfg_p = p.with_suffix(".json")
@@ -134,7 +133,6 @@ class EvalScorer:
             print(f"[eval] missing model/config ({p}, {cfg_p}); using material fallback")
             return
 
-        # 4) Build model + robust state_dict load
         try:
             cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
             self.model = EvalMLPtorch(
@@ -144,30 +142,7 @@ class EvalScorer:
                 device=self.device,
             )
             sd = _TorchBundle.torch.load(str(p), map_location="cpu")
-
-            def _try_load_whole(state) -> bool:
-                try:
-                    # prefer loading into the WHOLE model (expects keys like "net.0.weight")
-                    self.model.load_state_dict(state, strict=True)
-                    return True
-                except Exception:
-                    return False
-
-            loaded = _try_load_whole(sd)
-            if not loaded:
-                # If keys have "net.", strip and load into inner Sequential
-                if all(k.startswith("net.") for k in sd.keys()):
-                    sd2 = {k.split("net.", 1)[1]: v for k, v in sd.items()}  # "0.weight" ...
-                    self.model.net.load_state_dict(sd2, strict=True)
-                    loaded = True
-                else:
-                    # If keys lack "net.", add it and load to whole model
-                    sd2 = {f"net.{k}": v for k, v in sd.items()}
-                    loaded = _try_load_whole(sd2)
-
-            if not loaded:
-                raise RuntimeError("state_dict key mismatch (even after prefix adjust)")
-
+            self.model.load_state(sd)
             self.model.net.eval()
             self.using_fallback = False
             print(f"[eval] loaded {p.name} on {self.device} (cfg={cfg})")
@@ -182,13 +157,12 @@ class EvalScorer:
         feats = fen_to_features_py(board.fen())
         return self.model.forward(feats)
 
-# ---------- search ----------
+# -------- NN-guided search (safe for fallback) --------
 def _stm_cp_from_white(cp_white: int, board: chess.Board) -> int:
     return cp_white if board.turn == chess.WHITE else -cp_white
 
 def _blended_eval_cp(board: chess.Board, scorer: EvalScorer) -> int:
-    if scorer.using_fallback or scorer.model is None:
-        return _stm_cp_from_white(blended_eval_cp_material(board), board)
+    # NN (75%) + material (25%) → cp, stm POV
     nn_pawns = scorer.eval_white_pawns(board)
     nn_cp_white = int(nn_pawns * 100)
     mat = 0
@@ -251,7 +225,7 @@ def _negamax(board: chess.Board, depth: int, alpha: int, beta: int, deadline: fl
     best = -10**9
     for m in _order_inner(board, list(board.legal_moves)):
         board.push(m)
-        val = -_negamax(board, depth - 1, -beta, -alpha, deadline, scorer)
+        val = -_negamax(board, depth - 1, -beta, 10**9, deadline, scorer)
         board.pop()
         if val > best: best = val
         if best > alpha: alpha = best
@@ -289,7 +263,7 @@ def search_move(board: chess.Board, scorer: EvalScorer, max_depth: int, time_ms:
     if best_move is None: best_move = order[0]
     return best_move, _softmax(root_scores, TEMP)
 
-# ---------- ChessHacks entrypoints ----------
+# -------- ChessHacks entrypoints --------
 _SCORER: Optional[EvalScorer] = None
 
 @chess_manager.entrypoint
