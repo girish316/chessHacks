@@ -22,7 +22,7 @@ from .utils import chess_manager, GameContext  # provided by ChessHacks
 # ========= config (env) =========
 # Why: allow quick tuning without code edits.
 _ENV_MODEL = os.getenv("CHESS_EVAL_MODEL", "")  # absolute or relative path to .pt
-_ENV_DEVICE = os.getenv("CHESS_EVAL_DEVICE", "auto")  # auto|cpu|mps|cuda
+_ENV_DEVICE = os.getenv("CHESS_EVAL_DEVICE", "cpu")  # auto|cpu|mps|cuda
 _MAX_DEPTH = int(os.getenv("ENGINE_DEPTH", "4"))
 _TIME_MS = int(os.getenv("ENGINE_TIME_MS", "350"))
 _TEMP = float(os.getenv("ENGINE_TEMP", "1.0"))
