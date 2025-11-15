@@ -14,12 +14,13 @@ from chess import Move
 from .utils import chess_manager, GameContext
 
 # ---------- config ----------
-ENV_MODEL = os.getenv("CHESS_EVAL_MODEL", "")         # e.g., "src/eval_mlp.pt"
-ENV_DEVICE = os.getenv("CHESS_EVAL_DEVICE", "cpu")    # force CPU in prod
-ENV_DISABLE_NN = os.getenv("CHESS_EVAL_DISABLE_NN", "0") in ("1", "true", "True")
+ENV_MODEL = os.getenv("CHESS_EVAL_MODEL", "")
+ENV_DEVICE = os.getenv("CHESS_EVAL_DEVICE", "cpu")      # default CPU
+ENV_DISABLE_NN = os.getenv("CHESS_EVAL_DISABLE_NN", "1") in ("1", "true", "True")  # default: NN off for fast boot
 MAX_DEPTH = int(os.getenv("ENGINE_DEPTH", "3"))
 TIME_MS = int(os.getenv("ENGINE_TIME_MS", "250"))
 TEMP = float(os.getenv("ENGINE_TEMP", "1.0"))
+
 
 # ---------- features (no numpy dependency; pure Python lists) ----------
 # 12x64 bitboards + side + castling(4) + en passant(64) = 837 floats
@@ -108,13 +109,14 @@ class EvalScorer:
         self.using_fallback = True
         self.device_pref = device_pref
         self.device = "cpu"
-        self.model = None  # type: Optional[EvalMLPtorch]
+        self.model: Optional[EvalMLPtorch] = None
 
+        # 1) Fast exit if disabled
         if self.disable_nn:
             print("[eval] NN disabled via CHESS_EVAL_DISABLE_NN; using material fallback")
             return
 
-        # lazy import torch only if we plan to use NN
+        # 2) Lazy import torch
         try:
             import torch as _t
             import torch.nn as _nn
@@ -124,15 +126,15 @@ class EvalScorer:
             print(f"[eval] torch import failed ({e}); using material fallback")
             return
 
+        # 3) Device and paths
         self.device = _device_from(device_pref)
-
-        # resolve model/config
         p = Path(model_path) if model_path else Path(__file__).resolve().parent / "eval_mlp.pt"
         cfg_p = p.with_suffix(".json")
         if not (p.exists() and cfg_p.exists()):
             print(f"[eval] missing model/config ({p}, {cfg_p}); using material fallback")
             return
 
+        # 4) Build model + robust state_dict load
         try:
             cfg = json.loads(cfg_p.read_text(encoding="utf-8"))
             self.model = EvalMLPtorch(
@@ -142,7 +144,30 @@ class EvalScorer:
                 device=self.device,
             )
             sd = _TorchBundle.torch.load(str(p), map_location="cpu")
-            self.model.net.load_state_dict(sd, strict=True)
+
+            def _try_load_whole(state) -> bool:
+                try:
+                    # prefer loading into the WHOLE model (expects keys like "net.0.weight")
+                    self.model.load_state_dict(state, strict=True)
+                    return True
+                except Exception:
+                    return False
+
+            loaded = _try_load_whole(sd)
+            if not loaded:
+                # If keys have "net.", strip and load into inner Sequential
+                if all(k.startswith("net.") for k in sd.keys()):
+                    sd2 = {k.split("net.", 1)[1]: v for k, v in sd.items()}  # "0.weight" ...
+                    self.model.net.load_state_dict(sd2, strict=True)
+                    loaded = True
+                else:
+                    # If keys lack "net.", add it and load to whole model
+                    sd2 = {f"net.{k}": v for k, v in sd.items()}
+                    loaded = _try_load_whole(sd2)
+
+            if not loaded:
+                raise RuntimeError("state_dict key mismatch (even after prefix adjust)")
+
             self.model.net.eval()
             self.using_fallback = False
             print(f"[eval] loaded {p.name} on {self.device} (cfg={cfg})")
